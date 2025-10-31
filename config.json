@@ -1,0 +1,38 @@
+{
+  "database": {
+    "host": "timescaledb",
+    "port": 5432,
+    "database": "ims",
+    "user": "ims_user",
+    "password": "ims_password",
+    "max_connections": 10
+  },
+  "modules": {
+    "atlas-traceroute": {
+      "enabled": false,
+      "base_url": "https://data-store.ripe.net/datasets/atlas-daily-dumps",
+      "download_path": "/data/atlas",
+      "process_first_file_only": false,
+      "test_date": "2025-10-26"
+    },
+    "whois-lacnic": {
+      "enabled": false
+    },
+    "whois-afrinic": {
+      "enabled": false
+    },
+    "whois-apnic": {
+      "enabled": false
+    },
+    "whois-ripe": {
+      "enabled": true
+    },
+    "whois-arin": {
+      "enabled": false
+    }
+  },
+  "scheduler": {
+    "run_once": true,
+    "check_interval": "1m"
+  }
+}
