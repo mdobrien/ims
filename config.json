@@ -25,10 +25,10 @@
       "enabled": false
     },
     "whois-ripe": {
-      "enabled": true
+      "enabled": false
     },
     "whois-arin": {
-      "enabled": false
+      "enabled": true
     }
   },
   "scheduler": {

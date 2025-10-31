@@ -71,7 +71,7 @@ func (m *WhoisAPNICModule) Process(ctx context.Context) error {
 }
 
 func (m *WhoisAPNICModule) parseAndStore(ctx context.Context, reader *gzip.Reader) error {
-	const batchSize = 500
+	const batchSize = 10000
 
 	// Parse objects from stream
 	objects, errors := m.parser.ParseStream(reader)

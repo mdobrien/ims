@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/lib/pq"
@@ -203,6 +205,19 @@ func (s *Storage) Close() error {
 	return s.db.Close()
 }
 
+// isDuplicateKeyError checks if error is a PostgreSQL duplicate key violation
+func isDuplicateKeyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Use errors.As to handle wrapped errors
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "23505" // unique_violation
+	}
+	return false
+}
+
 // ============================================================================
 // WHOIS DATA STRUCTURES AND METHODS
 // ============================================================================
@@ -250,35 +265,51 @@ func (s *Storage) StoreInetnumBatch(ctx context.Context, data []InetnumData) err
 		return nil
 	}
 
+	// TRY: Fast path with COPY
+	err := s.storeInetnumBatchCopy(ctx, data)
+	if err == nil {
+		return nil // Success!
+	}
+
+	// DETECT: Check if it's a duplicate key error
+	if !isDuplicateKeyError(err) {
+		return err // Other error, fail fast
+	}
+
+	// FALLBACK: Use INSERT with ON CONFLICT for this batch
+	log.Printf("[Storage] COPY failed with duplicate key, falling back to INSERT for batch of %d inetnum", len(data))
+	return s.storeInetnumBatchInsert(ctx, data)
+}
+
+// storeInetnumBatchCopy performs bulk loading using COPY
+func (s *Storage) storeInetnumBatchCopy(ctx context.Context, data []InetnumData) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO whois_inetnum
-			(timestamp, source, range_start, range_end, netname, country, org_id, status,
-			 admin_c, tech_c, descr, created, last_modified, mnt_by, extra_attrs)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-		ON CONFLICT (source, range_start, range_end, last_modified, timestamp)
-		DO NOTHING
-	`)
+	// Use COPY for bulk loading - much faster than individual INSERTs
+	stmt, err := tx.PrepareContext(ctx, pq.CopyIn("whois_inetnum",
+		"timestamp", "source", "range_start", "range_end", "netname",
+		"country", "org_id", "status", "admin_c", "tech_c", "descr",
+		"created", "last_modified", "mnt_by", "extra_attrs"))
 	if err != nil {
-		return fmt.Errorf("prepare statement: %w", err)
+		return fmt.Errorf("prepare COPY: %w", err)
 	}
 	defer stmt.Close()
 
+	timestamp := time.Now()
 	for _, item := range data {
-		// Use interface{} for JSONB fields: nil → SQL NULL, []byte → JSON
+		// Prepare JSONB field
 		var extraJSON interface{}
 		if len(item.ExtraAttrs) > 0 {
 			b, _ := json.Marshal(item.ExtraAttrs)
-			extraJSON = b
+			extraJSON = string(b)  // Convert to string for COPY
 		}
 
-		_, err := stmt.ExecContext(ctx,
-			time.Now(), // timestamp = ingestion time
+		_, err = stmt.ExecContext(ctx,
+			timestamp,
 			item.Source,
 			item.RangeStart,
 			item.RangeEnd,
@@ -295,7 +326,68 @@ func (s *Storage) StoreInetnumBatch(ctx context.Context, data []InetnumData) err
 			extraJSON,
 		)
 		if err != nil {
-			return fmt.Errorf("insert inetnum: %w", err)
+			return fmt.Errorf("COPY row: %w", err)
+		}
+	}
+
+	// Execute the COPY
+	_, err = stmt.ExecContext(ctx)
+	if err != nil {
+		return fmt.Errorf("execute COPY: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// storeInetnumBatchInsert performs bulk insert using INSERT with ON CONFLICT
+func (s *Storage) storeInetnumBatchInsert(ctx context.Context, data []InetnumData) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO whois_inetnum (
+			timestamp, source, range_start, range_end, netname,
+			country, org_id, status, admin_c, tech_c, descr,
+			created, last_modified, mnt_by, extra_attrs
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		ON CONFLICT (source, range_start, range_end, last_modified, timestamp) DO NOTHING
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare INSERT: %w", err)
+	}
+	defer stmt.Close()
+
+	timestamp := time.Now()
+	for _, item := range data {
+		// Prepare JSONB field
+		var extraJSON interface{}
+		if len(item.ExtraAttrs) > 0 {
+			b, _ := json.Marshal(item.ExtraAttrs)
+			extraJSON = b
+		}
+
+		_, err = stmt.ExecContext(ctx,
+			timestamp,
+			item.Source,
+			item.RangeStart,
+			item.RangeEnd,
+			item.Netname,
+			item.Country,
+			item.OrgID,
+			item.Status,
+			pq.Array(item.AdminC),
+			pq.Array(item.TechC),
+			pq.Array(item.Descr),
+			item.Created,
+			item.LastModified,
+			pq.Array(item.MntBy),
+			extraJSON,
+		)
+		if err != nil {
+			return fmt.Errorf("INSERT row: %w", err)
 		}
 	}
 
@@ -308,43 +400,58 @@ func (s *Storage) StoreAutNumBatch(ctx context.Context, data []AutNumData) error
 		return nil
 	}
 
+	// TRY: Fast path with COPY
+	err := s.storeAutNumBatchCopy(ctx, data)
+	if err == nil {
+		return nil // Success!
+	}
+
+	// DETECT: Check if it's a duplicate key error
+	if !isDuplicateKeyError(err) {
+		return err // Other error, fail fast
+	}
+
+	// FALLBACK: Use INSERT with ON CONFLICT for this batch
+	log.Printf("[Storage] COPY failed with duplicate key, falling back to INSERT for batch of %d aut_num", len(data))
+	return s.storeAutNumBatchInsert(ctx, data)
+}
+
+// storeAutNumBatchCopy performs bulk loading using COPY
+func (s *Storage) storeAutNumBatchCopy(ctx context.Context, data []AutNumData) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO whois_aut_num
-			(timestamp, source, asn, as_name, descr, country, org_id, status,
-			 admin_c, tech_c, import_policy, export_policy, created, last_modified, mnt_by, extra_attrs)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-		ON CONFLICT (source, asn, last_modified, timestamp)
-		DO NOTHING
-	`)
+	// Use COPY for bulk loading - much faster than individual INSERTs
+	stmt, err := tx.PrepareContext(ctx, pq.CopyIn("whois_aut_num",
+		"timestamp", "source", "asn", "as_name", "descr", "country", "org_id", "status",
+		"admin_c", "tech_c", "import_policy", "export_policy", "created", "last_modified", "mnt_by", "extra_attrs"))
 	if err != nil {
-		return fmt.Errorf("prepare statement: %w", err)
+		return fmt.Errorf("prepare COPY: %w", err)
 	}
 	defer stmt.Close()
 
+	timestamp := time.Now()
 	for _, item := range data {
-		// Use interface{} for JSONB fields: nil → SQL NULL, []byte → JSON
+		// Prepare JSONB fields
 		var importJSON, exportJSON, extraJSON interface{}
 		if len(item.ImportPolicy) > 0 {
 			b, _ := json.Marshal(item.ImportPolicy)
-			importJSON = b
+			importJSON = string(b)  // Convert to string for COPY
 		}
 		if len(item.ExportPolicy) > 0 {
 			b, _ := json.Marshal(item.ExportPolicy)
-			exportJSON = b
+			exportJSON = string(b)  // Convert to string for COPY
 		}
 		if len(item.ExtraAttrs) > 0 {
 			b, _ := json.Marshal(item.ExtraAttrs)
-			extraJSON = b
+			extraJSON = string(b)  // Convert to string for COPY
 		}
 
-		_, err := stmt.ExecContext(ctx,
-			time.Now(),
+		_, err = stmt.ExecContext(ctx,
+			timestamp,
 			item.Source,
 			item.ASN,
 			item.ASName,
@@ -362,7 +469,76 @@ func (s *Storage) StoreAutNumBatch(ctx context.Context, data []AutNumData) error
 			extraJSON,
 		)
 		if err != nil {
-			return fmt.Errorf("insert aut-num: %w", err)
+			return fmt.Errorf("COPY row: %w", err)
+		}
+	}
+
+	// Execute the COPY
+	_, err = stmt.ExecContext(ctx)
+	if err != nil {
+		return fmt.Errorf("execute COPY: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// storeAutNumBatchInsert performs bulk insert using INSERT with ON CONFLICT
+func (s *Storage) storeAutNumBatchInsert(ctx context.Context, data []AutNumData) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO whois_aut_num (
+			timestamp, source, asn, as_name, descr, country, org_id, status,
+			admin_c, tech_c, import_policy, export_policy, created, last_modified, mnt_by, extra_attrs
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		ON CONFLICT (source, asn, last_modified, timestamp) DO NOTHING
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare INSERT: %w", err)
+	}
+	defer stmt.Close()
+
+	timestamp := time.Now()
+	for _, item := range data {
+		// Prepare JSONB fields
+		var importJSON, exportJSON, extraJSON interface{}
+		if len(item.ImportPolicy) > 0 {
+			b, _ := json.Marshal(item.ImportPolicy)
+			importJSON = b
+		}
+		if len(item.ExportPolicy) > 0 {
+			b, _ := json.Marshal(item.ExportPolicy)
+			exportJSON = b
+		}
+		if len(item.ExtraAttrs) > 0 {
+			b, _ := json.Marshal(item.ExtraAttrs)
+			extraJSON = b
+		}
+
+		_, err = stmt.ExecContext(ctx,
+			timestamp,
+			item.Source,
+			item.ASN,
+			item.ASName,
+			pq.Array(item.Descr),
+			item.Country,
+			item.OrgID,
+			item.Status,
+			pq.Array(item.AdminC),
+			pq.Array(item.TechC),
+			importJSON,
+			exportJSON,
+			item.Created,
+			item.LastModified,
+			pq.Array(item.MntBy),
+			extraJSON,
+		)
+		if err != nil {
+			return fmt.Errorf("INSERT row: %w", err)
 		}
 	}
 
@@ -416,34 +592,50 @@ func (s *Storage) StoreRoutesBatch(ctx context.Context, data []RouteData) error 
 		return nil
 	}
 
+	// TRY: Fast path with COPY
+	err := s.storeRoutesBatchCopy(ctx, data)
+	if err == nil {
+		return nil // Success!
+	}
+
+	// DETECT: Check if it's a duplicate key error
+	if !isDuplicateKeyError(err) {
+		return err // Other error, fail fast
+	}
+
+	// FALLBACK: Use INSERT with ON CONFLICT for this batch
+	log.Printf("[Storage] COPY failed with duplicate key, falling back to INSERT for batch of %d routes", len(data))
+	return s.storeRoutesBatchInsert(ctx, data)
+}
+
+// storeRoutesBatchCopy performs bulk loading using COPY
+func (s *Storage) storeRoutesBatchCopy(ctx context.Context, data []RouteData) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO whois_routes
-			(timestamp, source, prefix, origin_asn, descr, mnt_by, member_of, created, last_modified, extra_attrs)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (source, prefix, origin_asn, last_modified, timestamp)
-		DO NOTHING
-	`)
+	// Use COPY for bulk loading - much faster than individual INSERTs
+	stmt, err := tx.PrepareContext(ctx, pq.CopyIn("whois_routes",
+		"timestamp", "source", "prefix", "origin_asn", "descr", "mnt_by",
+		"member_of", "created", "last_modified", "extra_attrs"))
 	if err != nil {
-		return fmt.Errorf("prepare statement: %w", err)
+		return fmt.Errorf("prepare COPY: %w", err)
 	}
 	defer stmt.Close()
 
+	timestamp := time.Now()
 	for _, item := range data {
-		// Use interface{} for JSONB fields: nil → SQL NULL, []byte → JSON
+		// Prepare JSONB field
 		var extraJSON interface{}
 		if len(item.ExtraAttrs) > 0 {
 			b, _ := json.Marshal(item.ExtraAttrs)
-			extraJSON = b
+			extraJSON = string(b)  // Convert to string for COPY
 		}
 
-		_, err := stmt.ExecContext(ctx,
-			time.Now(),
+		_, err = stmt.ExecContext(ctx,
+			timestamp,
 			item.Source,
 			item.Prefix,
 			item.OriginASN,
@@ -455,7 +647,62 @@ func (s *Storage) StoreRoutesBatch(ctx context.Context, data []RouteData) error 
 			extraJSON,
 		)
 		if err != nil {
-			return fmt.Errorf("insert route: %w", err)
+			return fmt.Errorf("COPY row: %w", err)
+		}
+	}
+
+	// Execute the COPY
+	_, err = stmt.ExecContext(ctx)
+	if err != nil {
+		return fmt.Errorf("execute COPY: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// storeRoutesBatchInsert performs bulk insert using INSERT with ON CONFLICT
+func (s *Storage) storeRoutesBatchInsert(ctx context.Context, data []RouteData) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO whois_routes (
+			timestamp, source, prefix, origin_asn, descr, mnt_by,
+			member_of, created, last_modified, extra_attrs
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (source, prefix, origin_asn, last_modified, timestamp) DO NOTHING
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare INSERT: %w", err)
+	}
+	defer stmt.Close()
+
+	timestamp := time.Now()
+	for _, item := range data {
+		// Prepare JSONB field
+		var extraJSON interface{}
+		if len(item.ExtraAttrs) > 0 {
+			b, _ := json.Marshal(item.ExtraAttrs)
+			extraJSON = b
+		}
+
+		_, err = stmt.ExecContext(ctx,
+			timestamp,
+			item.Source,
+			item.Prefix,
+			item.OriginASN,
+			pq.Array(item.Descr),
+			pq.Array(item.MntBy),
+			pq.Array(item.MemberOf),
+			item.Created,
+			item.LastModified,
+			extraJSON,
+		)
+		if err != nil {
+			return fmt.Errorf("INSERT row: %w", err)
 		}
 	}
 
@@ -468,35 +715,51 @@ func (s *Storage) StoreOrgBatch(ctx context.Context, data []OrgData) error {
 		return nil
 	}
 
+	// TRY: Fast path with COPY
+	err := s.storeOrgBatchCopy(ctx, data)
+	if err == nil {
+		return nil // Success!
+	}
+
+	// DETECT: Check if it's a duplicate key error
+	if !isDuplicateKeyError(err) {
+		return err // Other error, fail fast
+	}
+
+	// FALLBACK: Use INSERT with ON CONFLICT for this batch
+	log.Printf("[Storage] COPY failed with duplicate key, falling back to INSERT for batch of %d organisations", len(data))
+	return s.storeOrgBatchInsert(ctx, data)
+}
+
+// storeOrgBatchCopy performs bulk loading using COPY
+func (s *Storage) storeOrgBatchCopy(ctx context.Context, data []OrgData) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO whois_organisations
-			(timestamp, source, org_id, org_name, org_type, country, address, email, phone,
-			 admin_c, tech_c, created, last_modified, mnt_ref, mnt_by, extra_attrs)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-		ON CONFLICT (source, org_id, last_modified, timestamp)
-		DO NOTHING
-	`)
+	// Use COPY for bulk loading - much faster than individual INSERTs
+	stmt, err := tx.PrepareContext(ctx, pq.CopyIn("whois_organisations",
+		"timestamp", "source", "org_id", "org_name", "org_type", "country",
+		"address", "email", "phone", "admin_c", "tech_c", "created",
+		"last_modified", "mnt_ref", "mnt_by", "extra_attrs"))
 	if err != nil {
-		return fmt.Errorf("prepare statement: %w", err)
+		return fmt.Errorf("prepare COPY: %w", err)
 	}
 	defer stmt.Close()
 
+	timestamp := time.Now()
 	for _, item := range data {
-		// Use interface{} for JSONB fields: nil → SQL NULL, []byte → JSON
+		// Prepare JSONB field
 		var extraJSON interface{}
 		if len(item.ExtraAttrs) > 0 {
 			b, _ := json.Marshal(item.ExtraAttrs)
-			extraJSON = b
+			extraJSON = string(b)  // Convert to string for COPY
 		}
 
-		_, err := stmt.ExecContext(ctx,
-			time.Now(),
+		_, err = stmt.ExecContext(ctx,
+			timestamp,
 			item.Source,
 			item.OrgID,
 			item.OrgName,
@@ -514,7 +777,69 @@ func (s *Storage) StoreOrgBatch(ctx context.Context, data []OrgData) error {
 			extraJSON,
 		)
 		if err != nil {
-			return fmt.Errorf("insert organisation: %w", err)
+			return fmt.Errorf("COPY row: %w", err)
+		}
+	}
+
+	// Execute the COPY
+	_, err = stmt.ExecContext(ctx)
+	if err != nil {
+		return fmt.Errorf("execute COPY: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// storeOrgBatchInsert performs bulk insert using INSERT with ON CONFLICT
+func (s *Storage) storeOrgBatchInsert(ctx context.Context, data []OrgData) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO whois_organisations (
+			timestamp, source, org_id, org_name, org_type, country,
+			address, email, phone, admin_c, tech_c, created,
+			last_modified, mnt_ref, mnt_by, extra_attrs
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+		ON CONFLICT (source, org_id, last_modified, timestamp) DO NOTHING
+	`)
+	if err != nil {
+		return fmt.Errorf("prepare INSERT: %w", err)
+	}
+	defer stmt.Close()
+
+	timestamp := time.Now()
+	for _, item := range data {
+		// Prepare JSONB field
+		var extraJSON interface{}
+		if len(item.ExtraAttrs) > 0 {
+			b, _ := json.Marshal(item.ExtraAttrs)
+			extraJSON = b
+		}
+
+		_, err = stmt.ExecContext(ctx,
+			timestamp,
+			item.Source,
+			item.OrgID,
+			item.OrgName,
+			item.OrgType,
+			item.Country,
+			pq.Array(item.Address),
+			pq.Array(item.Email),
+			pq.Array(item.Phone),
+			pq.Array(item.AdminC),
+			pq.Array(item.TechC),
+			item.Created,
+			item.LastModified,
+			pq.Array(item.MntRef),
+			pq.Array(item.MntBy),
+			extraJSON,
+		)
+		if err != nil {
+			return fmt.Errorf("INSERT row: %w", err)
 		}
 	}
 
@@ -527,6 +852,70 @@ func (s *Storage) StoreWhoisObjectsBatch(ctx context.Context, data []WhoisObject
 		return nil
 	}
 
+	// TRY: Fast path with COPY
+	err := s.storeWhoisObjectsBatchCopy(ctx, data)
+	if err == nil {
+		return nil // Success!
+	}
+
+	// DETECT: Check if it's a duplicate key error
+	if !isDuplicateKeyError(err) {
+		return err // Other error, fail fast
+	}
+
+	// FALLBACK: Use INSERT with ON CONFLICT for this batch
+	log.Printf("[Storage] COPY failed with duplicate key, falling back to INSERT for batch of %d whois_objects", len(data))
+	return s.storeWhoisObjectsBatchInsert(ctx, data)
+}
+
+// storeWhoisObjectsBatchCopy uses PostgreSQL COPY for fast bulk insertion
+func (s *Storage) storeWhoisObjectsBatchCopy(ctx context.Context, data []WhoisObjectData) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Use COPY for bulk loading - much faster than individual INSERTs
+	stmt, err := tx.PrepareContext(ctx, pq.CopyIn("whois_objects",
+		"timestamp", "source", "object_type", "object_key", "attributes", "last_modified"))
+	if err != nil {
+		return fmt.Errorf("prepare COPY: %w", err)
+	}
+	defer stmt.Close()
+
+	timestamp := time.Now()
+	for _, item := range data {
+		// Attributes must always be valid JSON
+		attrsJSON, err := json.Marshal(item.Attributes)
+		if err != nil {
+			return fmt.Errorf("marshal attributes: %w", err)
+		}
+
+		_, err = stmt.ExecContext(ctx,
+			timestamp,
+			item.Source,
+			item.ObjectType,
+			item.ObjectKey,
+			string(attrsJSON),  // Convert to string for COPY
+			item.LastModified,
+		)
+		if err != nil {
+			return fmt.Errorf("COPY row: %w", err)
+		}
+	}
+
+	// Execute the COPY
+	_, err = stmt.ExecContext(ctx)
+	if err != nil {
+		return fmt.Errorf("execute COPY: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// storeWhoisObjectsBatchInsert uses INSERT with ON CONFLICT for duplicate handling
+func (s *Storage) storeWhoisObjectsBatchInsert(ctx context.Context, data []WhoisObjectData) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -545,6 +934,7 @@ func (s *Storage) StoreWhoisObjectsBatch(ctx context.Context, data []WhoisObject
 	}
 	defer stmt.Close()
 
+	timestamp := time.Now()
 	for _, item := range data {
 		// Attributes must always be valid JSON
 		attrsJSON, err := json.Marshal(item.Attributes)
@@ -553,15 +943,15 @@ func (s *Storage) StoreWhoisObjectsBatch(ctx context.Context, data []WhoisObject
 		}
 
 		_, err = stmt.ExecContext(ctx,
-			time.Now(),
+			timestamp,
 			item.Source,
 			item.ObjectType,
 			item.ObjectKey,
-			attrsJSON,
+			string(attrsJSON),  // Convert to string for consistency
 			item.LastModified,
 		)
 		if err != nil {
-			return fmt.Errorf("insert whois object: %w", err)
+			return fmt.Errorf("insert row: %w", err)
 		}
 	}
 

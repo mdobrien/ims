@@ -217,7 +217,7 @@ func (pt *progressTracker) Read(p []byte) (n int, err error) {
 }
 
 func (m *WhoisRIPEModule) parseAndStore(ctx context.Context, reader *gzip.Reader) error {
-	const batchSize = 500
+	const batchSize = 10000
 
 	// Parse objects from stream
 	objects, errors := m.parser.ParseStream(reader)

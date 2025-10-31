@@ -4,8 +4,10 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -46,21 +48,55 @@ func (m *WhoisARINModule) Schedule() pkg.Schedule {
 func (m *WhoisARINModule) Process(ctx context.Context) error {
 	url := fmt.Sprintf("%s/arin.db.gz", m.baseURL)
 
-	log.Printf("[%s] Downloading: %s", m.Name(), url)
+	log.Printf("[%s] Starting download: %s", m.Name(), url)
 
-	// Download file
-	resp, err := http.Get(url)
+	// Download to temp file with retry logic
+	tmpFile := "/tmp/arin.db.gz"
+	var lastErr error
+	maxRetries := 3
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if attempt > 1 {
+			log.Printf("[%s] Retry attempt %d/%d", m.Name(), attempt, maxRetries)
+			time.Sleep(10 * time.Second) // Wait before retry
+		}
+
+		err := m.downloadToFile(ctx, url, tmpFile)
+		if err == nil {
+			break // Success
+		}
+		lastErr = err
+		log.Printf("[%s] Download attempt %d failed: %v", m.Name(), attempt, err)
+
+		if attempt == maxRetries {
+			return fmt.Errorf("download failed after %d attempts: %w", maxRetries, lastErr)
+		}
+	}
+
+	// Ensure temp file is cleaned up
+	defer func() {
+		if err := os.Remove(tmpFile); err != nil {
+			log.Printf("[%s] Warning: failed to remove temp file: %v", m.Name(), err)
+		}
+	}()
+
+	// Open the downloaded file
+	file, err := os.Open(tmpFile)
 	if err != nil {
-		return fmt.Errorf("download failed: %w", err)
+		return fmt.Errorf("failed to open downloaded file: %w", err)
 	}
-	defer resp.Body.Close()
+	defer file.Close()
 
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("download failed with status: %d", resp.StatusCode)
+	// Get file info for logging
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat file: %w", err)
 	}
+	log.Printf("[%s] Processing file: %s (size: %.2f MB)",
+		m.Name(), tmpFile, float64(fileInfo.Size())/(1024*1024))
 
 	// Decompress gzip
-	reader, err := gzip.NewReader(resp.Body)
+	reader, err := gzip.NewReader(file)
 	if err != nil {
 		return fmt.Errorf("gzip decompress: %w", err)
 	}
@@ -70,8 +106,86 @@ func (m *WhoisARINModule) Process(ctx context.Context) error {
 	return m.parseAndStore(ctx, reader)
 }
 
+func (m *WhoisARINModule) downloadToFile(ctx context.Context, url, filepath string) error {
+	// Create HTTP client with extended timeout
+	client := &http.Client{
+		Timeout: 30 * time.Minute, // 30 minutes for large file download
+	}
+
+	// Create request with context
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	// Execute request
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("http status %d", resp.StatusCode)
+	}
+
+	// Log response headers
+	contentLength := resp.Header.Get("Content-Length")
+	if contentLength != "" {
+		log.Printf("[%s] Content-Length: %s bytes", m.Name(), contentLength)
+	}
+
+	// Create temp file
+	tempFile, err := os.Create(filepath + ".tmp")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	defer tempFile.Close()
+
+	// Download with progress tracking
+	startTime := time.Now()
+	var totalBytes int64
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Create a reader that tracks progress
+	progressReader := &progressTracker{
+		reader:     resp.Body,
+		totalBytes: &totalBytes,
+		ticker:     ticker,
+		moduleName: m.Name(),
+		startTime:  startTime,
+	}
+
+	// Copy to file
+	written, err := io.Copy(tempFile, progressReader)
+	if err != nil {
+		os.Remove(filepath + ".tmp")
+		return fmt.Errorf("download copy: %w", err)
+	}
+
+	// Sync to disk
+	if err := tempFile.Sync(); err != nil {
+		os.Remove(filepath + ".tmp")
+		return fmt.Errorf("sync file: %w", err)
+	}
+
+	// Rename temp file to final name
+	if err := os.Rename(filepath+".tmp", filepath); err != nil {
+		os.Remove(filepath + ".tmp")
+		return fmt.Errorf("rename file: %w", err)
+	}
+
+	duration := time.Since(startTime)
+	log.Printf("[%s] Download complete: %.2f MB in %v (%.2f MB/s)",
+		m.Name(), float64(written)/(1024*1024), duration,
+		float64(written)/(1024*1024)/duration.Seconds())
+
+	return nil
+}
+
 func (m *WhoisARINModule) parseAndStore(ctx context.Context, reader *gzip.Reader) error {
-	const batchSize = 500
+	const batchSize = 10000
 
 	// Parse objects from stream
 	objects, errors := m.parser.ParseStream(reader)
@@ -79,10 +193,12 @@ func (m *WhoisARINModule) parseAndStore(ctx context.Context, reader *gzip.Reader
 	// Batch buffers
 	inetnumBatch := make([]pkg.InetnumData, 0, batchSize)
 	autnumBatch := make([]pkg.AutNumData, 0, batchSize)
+	routeBatch := make([]pkg.RouteData, 0, batchSize)
+	whoisObjectBatch := make([]pkg.WhoisObjectData, 0, batchSize)
 
+	objectsReceived := int64(0)
 	totalProcessed := int64(0)
 	totalErrors := 0
-	batchStart := time.Now()
 	overallStart := time.Now()
 
 	log.Printf("[%s] Starting to parse WHOIS objects (batch size: %d)...", m.Name(), batchSize)
@@ -114,11 +230,24 @@ func (m *WhoisARINModule) parseAndStore(ctx context.Context, reader *gzip.Reader
 					}
 					totalProcessed += int64(len(autnumBatch))
 				}
+				if len(routeBatch) > 0 {
+					if err := m.storage.StoreRoutesBatch(ctx, routeBatch); err != nil {
+						return fmt.Errorf("store route batch: %w", err)
+					}
+					totalProcessed += int64(len(routeBatch))
+				}
+				if len(whoisObjectBatch) > 0 {
+					if err := m.storage.StoreWhoisObjectsBatch(ctx, whoisObjectBatch); err != nil {
+						return fmt.Errorf("store whois object batch: %w", err)
+					}
+					totalProcessed += int64(len(whoisObjectBatch))
+				}
 
 				// Log completion
 				totalDuration := time.Since(overallStart)
-				rate := float64(totalProcessed) / totalDuration.Seconds()
-				log.Printf("[%s] Completed: %d objects, %d errors", m.Name(), totalProcessed, totalErrors)
+				rate := float64(objectsReceived) / totalDuration.Seconds()
+				log.Printf("[%s] Parsing complete: %d objects received, %d stored, %d errors",
+					m.Name(), objectsReceived, totalProcessed, totalErrors)
 				log.Printf("[%s] Total time: %v (%.1f objects/sec)", m.Name(), totalDuration, rate)
 
 				// Update module state
@@ -127,6 +256,17 @@ func (m *WhoisARINModule) parseAndStore(ctx context.Context, reader *gzip.Reader
 					errMsg = fmt.Sprintf("%d parse errors", totalErrors)
 				}
 				return m.storage.UpdateModuleState(ctx, m.Name(), true, totalProcessed, errMsg)
+			}
+
+			// Track objects received
+			objectsReceived++
+
+			// Log progress every 10,000 objects
+			if objectsReceived%10000 == 0 {
+				elapsed := time.Since(overallStart)
+				rate := float64(objectsReceived) / elapsed.Seconds()
+				log.Printf("[%s] Progress: %d objects received, %d stored (%.1f obj/sec)",
+					m.Name(), objectsReceived, totalProcessed, rate)
 			}
 
 			// Route object to appropriate batch
@@ -165,15 +305,61 @@ func (m *WhoisARINModule) parseAndStore(ctx context.Context, reader *gzip.Reader
 					totalProcessed += int64(len(autnumBatch))
 					autnumBatch = autnumBatch[:0]
 				}
-			}
 
-			// Log progress
-			if totalProcessed%5000 == 0 && totalProcessed > 0 {
-				batchDuration := time.Since(batchStart)
-				rate := float64(5000) / batchDuration.Seconds()
-				log.Printf("[%s] Processed %d objects (%.1f obj/sec)",
-					m.Name(), totalProcessed, rate)
-				batchStart = time.Now()
+			case "route", "route6":
+				data, err := m.convertRoute(obj)
+				if err != nil {
+					totalErrors++
+					continue
+				}
+				routeBatch = append(routeBatch, data)
+
+				// Flush batch if full
+				if len(routeBatch) >= batchSize {
+					if err := m.storage.StoreRoutesBatch(ctx, routeBatch); err != nil {
+						return fmt.Errorf("store route batch: %w", err)
+					}
+					totalProcessed += int64(len(routeBatch))
+					routeBatch = routeBatch[:0]
+				}
+
+			default:
+				// Handle other object types (as-set, route-set, etc.)
+				// Convert attributes to map for storage
+				attrs := make(map[string]interface{})
+				for key, values := range obj.Attributes {
+					if len(values) == 1 {
+						attrs[key] = values[0]
+					} else {
+						attrs[key] = values
+					}
+				}
+
+				genericObj := pkg.WhoisObjectData{
+					Source:       "arin-whois",
+					ObjectType:   obj.Type,
+					ObjectKey:    obj.PrimaryKey,
+					Attributes:   attrs,
+					LastModified: time.Now(),
+				}
+
+				// Try to extract last-modified if present
+				if lastMod := obj.GetAttribute("last-modified"); lastMod != "" {
+					if t, err := time.Parse(time.RFC3339, lastMod); err == nil {
+						genericObj.LastModified = t
+					}
+				}
+
+				whoisObjectBatch = append(whoisObjectBatch, genericObj)
+
+				// Flush batch if full
+				if len(whoisObjectBatch) >= batchSize {
+					if err := m.storage.StoreWhoisObjectsBatch(ctx, whoisObjectBatch); err != nil {
+						return fmt.Errorf("store whois object batch: %w", err)
+					}
+					totalProcessed += int64(len(whoisObjectBatch))
+					whoisObjectBatch = whoisObjectBatch[:0]
+				}
 			}
 		}
 	}
@@ -261,6 +447,59 @@ func (m *WhoisARINModule) convertAutNum(obj *rpsl.Object) (pkg.AutNumData, error
 	}
 
 	// ARIN uses last-modified field (RFC3339 format)
+	if lastMod := obj.GetAttribute("last-modified"); lastMod != "" {
+		if t, err := time.Parse(time.RFC3339, lastMod); err == nil {
+			data.LastModified = t
+		}
+	}
+
+	return data, nil
+}
+
+func (m *WhoisARINModule) convertRoute(obj *rpsl.Object) (pkg.RouteData, error) {
+	// Extract route prefix
+	prefix := obj.PrimaryKey
+	if prefix == "" {
+		return pkg.RouteData{}, fmt.Errorf("missing route prefix")
+	}
+
+	// Extract origin AS
+	originStr := obj.GetAttribute("origin")
+	if originStr == "" {
+		return pkg.RouteData{}, fmt.Errorf("missing origin AS")
+	}
+
+	// Strip "AS" prefix if present
+	originStr = strings.TrimPrefix(originStr, "AS")
+	origin, err := strconv.ParseInt(originStr, 10, 64)
+	if err != nil {
+		return pkg.RouteData{}, fmt.Errorf("invalid origin AS %s: %w", originStr, err)
+	}
+
+	data := pkg.RouteData{
+		Source:       "arin-whois",
+		Prefix:       prefix,
+		OriginASN:    origin,
+		LastModified: time.Now(),
+	}
+
+	// Extract optional multi-value fields
+	if descrs := obj.GetAttributes("descr"); len(descrs) > 0 {
+		data.Descr = descrs
+	}
+	if mntBy := obj.GetAttributes("mnt-by"); len(mntBy) > 0 {
+		data.MntBy = mntBy
+	}
+	if memberOf := obj.GetAttributes("member-of"); len(memberOf) > 0 {
+		data.MemberOf = memberOf
+	}
+
+	// Parse timestamps
+	if created := obj.GetAttribute("created"); created != "" {
+		if t, err := time.Parse(time.RFC3339, created); err == nil {
+			data.Created = &t
+		}
+	}
 	if lastMod := obj.GetAttribute("last-modified"); lastMod != "" {
 		if t, err := time.Parse(time.RFC3339, lastMod); err == nil {
 			data.LastModified = t

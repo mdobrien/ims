@@ -1,3 +1,6 @@
+### Development Environment
+The database and application are run in a containers via docker compose
+
 ## Kickstart
 
 This project follows a strict **build-test-repeat** pattern where:
@@ -5,6 +8,7 @@ This project follows a strict **build-test-repeat** pattern where:
 - No phase begins until the previous phase is fully tested and validated
 - Every build step is immediately followed by comprehensive testing
 - We maintain a healthy balance between building new features and validating existing ones
+- When exploring a new design always provide several options with pro/cons of each option
 
 **Premature optimization and complexity is highly undesirable.**
 
@@ -13,6 +17,9 @@ This project follows a strict **build-test-repeat** pattern where:
 
 Take a step back and slow down. Isolate the root cause. Do not make code changes other then adding logs or
 writing debug tests in scratch. Identidy the root cause. Then implement the fix. create an issue in scratch/issues. This should be continuously updated throughout the debugging process. The issue is the central place for information validation results, fix summaries, list of test files created during debuging.
+
+### Issues
+when working on an issue always update the existing issue do not create a new issue for the update.
 
     📊 Success Criteria
 
@@ -65,3 +72,6 @@ Think of `scratch/` as your development scratchpad—a place for tools that make
 
 ### Creating network configs for core
 - you can't have 3 nodes all on the same link in CORE. Each link connects exactly 2 nodes. Let me create a proper hub-and-spoke topology instead where B is in the middle:
+<reminder>
+when working through an issue do not create new issues. update the existing one and expand its context as needed
+</reminder>
